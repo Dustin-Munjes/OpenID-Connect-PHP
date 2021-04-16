@@ -3,7 +3,7 @@
  *
  * Copyright MITRE 2020
  *
- * OpenIDConnectClient for PHP5
+ * OpenIDConnectClient for PHP7
  * Author: Michael Jett <mjett@mitre.org>
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -21,6 +21,19 @@
  */
 
 namespace Jumbojett;
+
+use Jose\Component\Checker\HeaderCheckerManager;
+use Jose\Component\Core\AlgorithmManager;
+use Jose\Component\Core\JWKSet;
+use Jose\Component\Encryption\Compression\CompressionMethodManager;
+use Jose\Component\Encryption\JWEDecrypter;
+use Jose\Component\Encryption\JWELoader;
+use Jose\Component\Encryption\Serializer\JWESerializerManager;
+use Jose\Component\KeyManagement\JWKFactory;
+use Jose\Component\Signature\JWSLoader;
+use Jose\Component\Signature\JWSVerifier;
+use Jose\Component\Signature\Serializer\CompactSerializer;
+use Jose\Component\Signature\Serializer\JWSSerializerManager;
 
 /**
  *
@@ -238,6 +251,22 @@ class OpenIDConnectClient
     private $pkceAlgs = array('S256' => 'sha256', 'plain' => false);
 
     /**
+     * @var \Jose\Component\Checker\HeaderCheckerManager
+     */
+    private $headerCheckerManager;
+
+    /**
+     * @var \Jose\Component\Signature\JWSLoader
+     */
+    private $jwsLoader;
+
+    /**
+     * @var \Jose\Component\Encryption\JWELoader
+     */
+    private $jweLoader;
+
+
+    /**
      * @param $provider_url string optional
      *
      * @param $client_id string optional
@@ -258,6 +287,78 @@ class OpenIDConnectClient
         $this->issuerValidator = function($iss){
 	        return ($iss === $this->getIssuer() || $iss === $this->getWellKnownIssuer() || $iss === $this->getWellKnownIssuer(true));
         };
+    }
+
+    /**
+     * @param array $algorithms
+     */
+    public function createJWSLoader(array $algorithms) {
+        $jwsSerializerManager = new JWSSerializerManager(
+            [new CompactSerializer()]
+        );
+
+        $signatureAlgorithmManager = new AlgorithmManager($algorithms);
+        $jwsVerifier = new JWSVerifier($signatureAlgorithmManager);
+
+        $this->jwsLoader = new JWSLoader(
+            $jwsSerializerManager,
+            $jwsVerifier,
+            $this->headerCheckerManager
+        );
+    }
+
+    /**
+     * @param array $keyEncryptionAlgorithms
+     * @param array $contentEncryptionAlgorithms
+     * @param array $compressionMethods
+     */
+    public function createJWELoader(array $keyEncryptionAlgorithms, array $contentEncryptionAlgorithms,
+                                    $compressionMethods = []) {
+        $jweSerializerManager = new JWESerializerManager(
+            [new \Jose\Component\Encryption\Serializer\CompactSerializer()]
+        );
+        $keyEncryptionAlgorithmManager = new AlgorithmManager($keyEncryptionAlgorithms);
+        $contentEncryptionAlgorithmManager = new AlgorithmManager($contentEncryptionAlgorithms);
+        $compressionMethodManager = new CompressionMethodManager($compressionMethods);
+        $jweDecrypter = new JWEDecrypter(
+            $keyEncryptionAlgorithmManager,
+            $contentEncryptionAlgorithmManager,
+            $compressionMethodManager
+        );
+
+        $this->jweLoader = new JWELoader(
+          $jweSerializerManager,
+          $jweDecrypter,
+          $this->headerCheckerManager
+        );
+    }
+
+    /**
+     * @param array $headers
+     */
+    public function createHeaderCheckerManager(array $checkers, array $tokenTypes) {
+        $this->headerCheckerManager = new HeaderCheckerManager($checkers, $tokenTypes);
+    }
+
+    /**
+     * @param $key
+     * @param string $secret
+     * @return \Jose\Component\Core\JWK
+     */
+    public function loadPrivateKey($key, $secret = '') {
+        return JWKFactory::createFromKey($key, $secret);
+    }
+
+    /**
+     * @param null $cert
+     * @return \Jose\Component\Core\JWKSet|mixed
+     * @throws \Jumbojett\OpenIDConnectClientException
+     */
+    public function loadPublicKeySet($cert = null) {
+        if (!isset($cert)) {
+            return json_decode($this->fetchURL($this->getProviderConfigValue('jwks_uri')));
+        }
+        return new JWKSet([JWKFactory::createFromCertificate($cert)]);
     }
 
     /**
@@ -341,7 +442,6 @@ class OpenIDConnectClient
 
             // If this is a valid claim
             if ($this->verifyJWTclaims($claims, $token_json->access_token)) {
-
                 // Clean up the session a little
                 $this->unsetNonce();
 
@@ -541,7 +641,7 @@ class OpenIDConnectClient
     }
 
     /**
-     * Set optionnal parameters for .well-known/openid-configuration 
+     * Set optionnal parameters for .well-known/openid-configuration
      *
      * @param string $param
      *
