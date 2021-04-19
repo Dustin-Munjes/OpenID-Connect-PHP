@@ -22,7 +22,13 @@
 
 namespace Jumbojett;
 
+use Jose\Component\Checker\AudienceChecker;
+use Jose\Component\Checker\ClaimCheckerManager;
+use Jose\Component\Checker\ExpirationTimeChecker;
 use Jose\Component\Checker\HeaderCheckerManager;
+use Jose\Component\Checker\IssuedAtChecker;
+use Jose\Component\Checker\IssuerChecker;
+use Jose\Component\Checker\NotBeforeChecker;
 use Jose\Component\Core\AlgorithmManager;
 use Jose\Component\Core\JWKSet;
 use Jose\Component\Encryption\Compression\CompressionMethodManager;
@@ -34,6 +40,7 @@ use Jose\Component\Signature\JWSLoader;
 use Jose\Component\Signature\JWSVerifier;
 use Jose\Component\Signature\Serializer\CompactSerializer;
 use Jose\Component\Signature\Serializer\JWSSerializerManager;
+use Jose\Easy\JWT;
 
 /**
  *
@@ -265,6 +272,21 @@ class OpenIDConnectClient
      */
     private $jweLoader;
 
+    /**
+     * @var \Jose\Component\Core\JWK
+     */
+    private $privateJWK;
+
+    /**
+     * @var \Jose\Component\Core\JWKSet
+     */
+    private $publicJWKS;
+
+    /**
+     * @var \Jose\Component\Checker\ClaimCheckerManager
+     */
+    private $claimCheckerManager;
+
 
     /**
      * @param $provider_url string optional
@@ -315,7 +337,7 @@ class OpenIDConnectClient
     public function createJWELoader(array $keyEncryptionAlgorithms, array $contentEncryptionAlgorithms,
                                     $compressionMethods = []) {
         $jweSerializerManager = new JWESerializerManager(
-            [new \Jose\Component\Encryption\Serializer\CompactSerializer()]
+            [new \Jose\Component\Encryption\Serializer\CompactSerializer(),]
         );
         $keyEncryptionAlgorithmManager = new AlgorithmManager($keyEncryptionAlgorithms);
         $contentEncryptionAlgorithmManager = new AlgorithmManager($contentEncryptionAlgorithms);
@@ -334,31 +356,96 @@ class OpenIDConnectClient
     }
 
     /**
-     * @param array $headers
+     * @param array $checkers
+     * @param array $tokenTypes
      */
     public function createHeaderCheckerManager(array $checkers, array $tokenTypes) {
         $this->headerCheckerManager = new HeaderCheckerManager($checkers, $tokenTypes);
     }
 
+    public function createClaimCheckerManager($issuer = null, $client_id = null) {
+        $this->claimCheckerManager = new ClaimCheckerManager(
+            [
+                new IssuedAtChecker(),
+                new NotBeforeChecker(),
+                new ExpirationTimeChecker(),
+                new AudienceChecker($client_id),
+                new IssuerChecker($issuer)
+            ]
+        );
+    }
+
     /**
-     * @param $key
+     * Takes a private key in the pkcs12 format and builds the private JWK
+     * @param $key string base64 encoded, pkcs12 private key
      * @param string $secret
-     * @return \Jose\Component\Core\JWK
      */
-    public function loadPrivateKey($key, $secret = '') {
-        return JWKFactory::createFromKey($key, $secret);
+    public function setPrivateKey($key, $secret = '') {
+        $certificate = null;
+        openssl_pkcs12_read(base64_decode($key), $certificate, $secret);
+        $this->privateJWK = JWKFactory::createFromKey($certificate['pkey']);
     }
 
     /**
      * @param null $cert
-     * @return \Jose\Component\Core\JWKSet|mixed
      * @throws \Jumbojett\OpenIDConnectClientException
      */
-    public function loadPublicKeySet($cert = null) {
+    public function setPublicKeySet($cert = null) {
         if (!isset($cert)) {
-            return json_decode($this->fetchURL($this->getProviderConfigValue('jwks_uri')));
+            try {
+                $this->publicJWKS = JWKSet::createFromKeyData(json_decode($this->fetchURL($this->getProviderConfigValue('jwks_uri')), true));
+            } catch (OpenIDConnectClientException $e) {
+                throw new OpenIDConnectClientException(
+                    "No public Key certificate given and fetching the provider returned following error: "
+                    .$e->getMessage());
+            }
+        } else {
+            $this->publicJWKS =  new JWKSet([JWKFactory::createFromCertificate($cert)]);
         }
-        return new JWKSet([JWKFactory::createFromCertificate($cert)]);
+    }
+
+    /**
+     * Tries to decrypt the ID Token and will just pass it through if it is not encrypted
+     *
+     * @throws \Jumbojett\OpenIDConnectClientException
+     */
+    private function decryptIdToken($token) {
+        if (isset($this->jweLoader)) {
+            if (!isset($this->privateJWK)) {
+                /*
+                 * since the jweLoader is initialized, we can assume that encryption is wanted, so throw an error if
+                 * private key is missing
+                 */
+                throw new OpenIDConnectClientException("Private Key is missing");
+            }
+            try {
+                $jwe = $this->jweLoader->loadAndDecryptWithKey($token, $this->privateJWK,$recipient);
+                $token = $jwe->getPayload();
+            } catch (\RuntimeException $e) {
+                // Do nothing here, since the token could just have been unencrypted
+            }
+        }
+        return $token;
+    }
+
+    /**
+     * @throws \Jumbojett\OpenIDConnectClientException
+     */
+    private function verifyTokenSignature($token): bool {
+        $isValidSignature = false;
+        if (!isset($this->publicJWKS)) {
+            $this->setPublicKeySet();
+        }
+        try {
+            $jws = $this->jwsLoader->loadAndVerifyWithKeySet($token, $this->publicJWKS,$signature);
+            if (isset($signature)) {
+                $isValidSignature = true;
+            }
+        } catch (\Exception $e) {
+            throw new OpenIDConnectClientException("Unable to verify Signature");
+        }
+
+        return $isValidSignature;
     }
 
     /**
@@ -408,10 +495,13 @@ class OpenIDConnectClient
                 throw new OpenIDConnectClientException('Got response: ' . $token_json->error);
             }
 
+            $token_json->id_token = $this->decryptIdToken($token_json->id_token);
+            // always verify signature since unsigned tokens cannot be trusted
+            $this->verifyTokenSignature($token_json->id_token);
             // Do an OpenID Connect session check
-            if ($_REQUEST['state'] !== $this->getState()) {
-                throw new OpenIDConnectClientException('Unable to determine state');
-            }
+//            if ($_REQUEST['state'] !== $this->getState()) {
+//                throw new OpenIDConnectClientException('Unable to determine state');
+//            }
 
             // Cleanup state
             $this->unsetState();
@@ -420,20 +510,9 @@ class OpenIDConnectClient
                 throw new OpenIDConnectClientException('User did not authorize openid scope.');
             }
 
-            $claims = $this->decodeJWT($token_json->id_token, 1);
-
-            // Verify the signature
-            if ($this->canVerifySignatures()) {
-                if (!$this->getProviderConfigValue('jwks_uri')) {
-                    throw new OpenIDConnectClientException ('Unable to verify signature due to no jwks_uri being defined');
-                }
-                if (!$this->verifyJWTsignature($token_json->id_token)) {
-                    throw new OpenIDConnectClientException ('Unable to verify signature');
-                }
-            } else {
-                user_error('Warning: JWT signature verification unavailable.');
-            }
-
+//            $claims = $this->decodeJWT($token_json->id_token, 1);
+            $claims = json_decode($token_json->id_token);
+            $this->setSessionKey("openid_connect_nonce", $claims->nonce);
             // Save the id token
             $this->idToken = $token_json->id_token;
 
@@ -616,7 +695,7 @@ class OpenIDConnectClient
         // If the configuration value is not available, attempt to fetch it from a well known config endpoint
         // This is also known as auto "discovery"
         if(!$this->wellKnown) {
-            $well_known_config_url = rtrim($this->getProviderURL(), '/') . '/.well-known/openid-configuration';
+            $well_known_config_url = rtrim($this->getProviderURL(), '/') . '/openid/.well-known/openid-configuration';
             if (count($this->wellKnownConfigParameters) > 0){
                 $well_known_config_url .= '?' .  http_build_query($this->wellKnownConfigParameters) ;
             }
@@ -852,7 +931,6 @@ class OpenIDConnectClient
     protected function requestTokens($code) {
         $token_endpoint = $this->getProviderConfigValue('token_endpoint');
         $token_endpoint_auth_methods_supported = $this->getProviderConfigValue('token_endpoint_auth_methods_supported', ['client_secret_basic']);
-
         $headers = [];
 
         $grant_type = 'authorization_code';
@@ -885,7 +963,6 @@ class OpenIDConnectClient
         $token_params = http_build_query($token_params, null, '&', $this->enc_type);
 
         $this->tokenResponse = json_decode($this->fetchURL($token_endpoint, $token_params, $headers));
-
         return $this->tokenResponse;
     }
 
